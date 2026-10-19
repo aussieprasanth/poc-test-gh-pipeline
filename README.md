@@ -1,3 +1,15 @@
+# Build
+
+Use JDK 11 and Maven to build and test the application:
+
+```shell
+mvn -B clean test package
+```
+
+The build produces `target/helloworld.war`, test results in
+`target/surefire-reports/`, and coverage reports in `target/site/jacoco/`.
+JUnit 4.13.2 is required for compatibility with current Maven Surefire versions.
+The GitHub Actions build uses Ubuntu 24.04 and Node.js 24-based actions.
 
 # Contributing
 
