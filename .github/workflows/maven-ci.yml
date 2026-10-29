@@ -1,0 +1,124 @@
+# Source: azure-pipelines.yml (retained unchanged).
+# CI-only migration: raw report artifacts are NOT equivalent to Azure's test
+# runs, coverage dashboard, source highlighting, or coverage diff publication.
+# Reporting parity remains blocked pending an approved reporting integration.
+# ADO UI trigger overrides/schedules, fork policies, checkout depth/tag settings,
+# retention, and required status checks were unavailable; reconcile before cutover.
+name: Maven CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # No source parameters are declared. Dispatch requires this workflow on the
+  # default branch and repository write access; the user can select a branch/ref.
+  # ADO UI queue-time variables/settings were unavailable, not inferred absent.
+  workflow_dispatch:
+
+# ADO PR autoCancel defaults to true; push batch defaults to false.
+# Non-PR events have unique groups so push/manual runs never cancel one another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    # ADO's documented default job timeout (not GitHub's 360-minute default).
+    timeout-minutes: 60
+    # Map Pipeline.Workspace to the parent of the source checkout. Both values
+    # use a valid github context, not runner context or sibling env references.
+    env:
+      MAVEN_CACHE_FOLDER: ${{ github.workspace }}/../.m2/repository
+      MAVEN_OPTS: -Dmaven.repo.local=${{ github.workspace }}/../.m2/repository
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          # GitHub defaults; actual ADO UI depth/tag/clean values are unverified.
+          fetch-depth: 1
+          fetch-tags: false
+          clean: true
+          lfs: false
+          submodules: false
+
+      - name: Cache Maven packages
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.MAVEN_CACHE_FOLDER }}
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Set up JDK 11
+        # This verified release does not inject -ntp into MAVEN_ARGS; later v5
+        # metadata adds a progress toggle unsupported by the local validator.
+        uses: actions/setup-java@v5.0.0
+        with:
+          # Source pins Java 11, not a vendor/patch. Temurin is a compatible
+          # OpenJDK choice; source agent vendor/patch equivalence is unverified.
+          distribution: temurin
+          java-version: '11'
+          architecture: x64
+          overwrite-settings: false
+
+      - name: Build, test and package
+        id: maven
+        # Maven comes from the hosted image, as with Maven@4's Default version.
+        # No added goals, heap options, coverage injection, or missing-test gate.
+        run: mvn -f pom.xml -B clean verify
+
+      - name: Collect JUnit XML (dashboard parity gap)
+        if: ${{ !cancelled() && (steps.maven.outcome == 'success' || steps.maven.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: junit-results
+          path: '**/surefire-reports/TEST-*.xml'
+          if-no-files-found: warn
+
+      - name: Collect JaCoCo XML (dashboard parity gap)
+        # succeededOrFailed(), not always(): do not collect after cancellation.
+        if: ${{ success() || failure() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: jacoco-coverage
+          path: target/site/jacoco/jacoco.xml
+          # Source failIfCoverageEmpty=false; no new threshold is introduced.
+          if-no-files-found: warn
+
+      # Native Actions has no CopyFiles@2 task. This small adapter preserves
+      # top-level *.war matching, no-match success, and no-overwrite copying.
+      # It has been statically reviewed only, not executed.
+      - name: Stage WAR file
+        run: |
+          if [[ ! -d target ]]; then
+            echo '::error::CopyFiles source folder target does not exist.'
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/artifact-staging"
+          shopt -s nullglob dotglob
+          for file in target/*.war; do
+            if [[ -f "$file" ]]; then
+              cp --no-clobber -- "$file" "$RUNNER_TEMP/artifact-staging/"
+            fi
+          done
+
+      - name: Publish WAR artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: drop
+          path: ${{ runner.temp }}/artifact-staging/
+          include-hidden-files: true
+          if-no-files-found: warn
+          # Retention is intentionally not invented; GitHub repository default
+          # applies until reconciled with unavailable ADO retention settings.
