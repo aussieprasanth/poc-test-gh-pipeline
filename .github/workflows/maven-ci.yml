@@ -1,0 +1,116 @@
+# Source: azure-pipelines.yml (left unchanged).
+# Review prerequisites: confirm ADO repository provider, trigger overrides,
+# checkout depth/tag settings, UI schedules, queue-time variables and retention.
+# Raw report artifacts below are NOT ADO test/coverage dashboard equivalence.
+# ADO coverage cjson/diff reporting and publication error semantics remain gaps.
+name: Maven CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  # Available once this workflow exists on the default branch; requires write
+  # access. Selectable refs are not restricted by the automatic branch filters.
+  workflow_dispatch:
+
+# Preserve the documented ADO PR autoCancel default, without cancelling push
+# or manual runs. The run ID makes each non-PR concurrency group independent.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Pipeline.Workspace is the parent of the source checkout in the ADO job.
+  # Keep the local Maven repository outside the checkout on GitHub as well.
+  MAVEN_CACHE_FOLDER: ${{ github.workspace }}/../.m2/repository
+  MAVEN_OPTS: -Dmaven.repo.local=${{ github.workspace }}/../.m2/repository
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    # Documented ADO job default; do not inherit GitHub's longer default.
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+          lfs: false
+          submodules: false
+          # ADO's effective depth/tags/clean depend on unavailable UI settings.
+          # These are the GitHub defaults, not a claim of source equivalence.
+          fetch-depth: 1
+          fetch-tags: false
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          java-version: '11'
+          distribution: temurin
+          architecture: x64
+          # Do not add this action's default -ntp to the source Maven arguments.
+          show-download-progress: true
+          overwrite-settings: false
+          # No setup-java cache: the source has an explicit cache contract.
+
+      - name: Cache Maven packages
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ env.MAVEN_CACHE_FOLDER }}
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+          # Default success-only post-job save matches Cache@2.
+
+      - name: Build, test and package
+        id: maven
+        # Use the hosted Maven, as Maven@4's mavenVersionOption: Default does.
+        # POM-owned JaCoCo 0.8.2 remains unchanged; no coverage injection.
+        # No continue-on-error: retain Maven's native failure exit status.
+        run: mvn -f pom.xml -B clean verify
+
+      - name: Collect JUnit XML (dashboard parity unresolved)
+        if: ${{ !cancelled() && (steps.maven.outcome == 'success' || steps.maven.outcome == 'failure') }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: junit-results
+          path: '**/surefire-reports/TEST-*.xml'
+          if-no-files-found: warn
+
+      - name: Collect JaCoCo reports (dashboard parity unresolved)
+        # ADO succeededOrFailed(): collect after failure, but not cancellation.
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: jacoco-coverage
+          path: target/site/jacoco/
+          # Includes the specified jacoco.xml and POM-generated HTML.
+          # No coverage threshold or missing-coverage failure is introduced.
+          if-no-files-found: warn
+
+      - name: Publish WAR artifact
+        # Direct upload replaces CopyFiles@2 staging, retaining only root WARs.
+        # Artifact contents have no extra target/ directory and belong to this
+        # run. There is no downstream artifact consumer in the source pipeline.
+        if: ${{ success() }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: drop
+          path: target/*.war
+          # CopyFiles@2 succeeds with no matches; do not invent a required-WAR
+          # gate. Empty-container publication remains unverified.
+          if-no-files-found: warn
+          # Retention inherits GitHub settings, NOT verified ADO retention.
