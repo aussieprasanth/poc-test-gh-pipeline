@@ -1,0 +1,119 @@
+# Source: azure-pipelines.yml (Maven@4, Cache@2, coverage and WAR publication).
+# Report artifacts preserve available files, not Azure Pipelines test/coverage UI.
+# ADO UI trigger overrides, checkout depth/tags and retention remain unverified.
+name: Maven CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions: {}
+
+# ADO pr.autoCancel defaults to true; push batching defaults to false.
+# Every non-PR run has an independent group and is never auto-cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    # ADO's omitted job timeout defaults to 60 minutes.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          # Effective ADO UI depth/tags were not supplied.
+          fetch-depth: 1
+          fetch-tags: false
+          lfs: false
+          submodules: false
+
+      # Runtime initialization avoids invalid runner contexts in job-level env.
+      # Paths replace ADO workspace/staging directories outside checked-out code.
+      - name: Initialize Maven and artifact paths
+        run: |
+          printf 'MAVEN_CACHE_FOLDER=%s/.m2/repository\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'MAVEN_OPTS=-Dmaven.repo.local=%s/.m2/repository\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          printf 'ARTIFACT_STAGING_DIRECTORY=%s/war-staging\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/.m2/repository" "$RUNNER_TEMP/war-staging"
+
+      - name: Cache Maven packages
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.MAVEN_CACHE_FOLDER }}
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v5
+        with:
+          # Source specifies Java 11, not a vendor or patch. Temurin supports 11.
+          distribution: temurin
+          java-version: '11'
+          architecture: x64
+          overwrite-settings: false
+
+      - name: Build, test and package
+        id: maven
+        # Source MAVEN_OPTS replaces the task's -Xmx1024m default.
+        # Prevent setup-java defaults from adding Maven CLI flags.
+        env:
+          MAVEN_ARGS: ''
+        run: mvn -f pom.xml -B clean verify
+
+      - name: Collect JUnit results
+        if: ${{ !cancelled() && (steps.maven.outcome == 'success' || steps.maven.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: junit-results
+          path: '**/surefire-reports/TEST-*.xml'
+          if-no-files-found: warn
+
+      - name: Collect JaCoCo coverage
+        # Source condition is succeededOrFailed(), not always().
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: jacoco-coverage
+          # Includes jacoco.xml and the POM-generated HTML/source views.
+          path: target/site/jacoco/
+          if-no-files-found: warn
+
+      # Adapter required for CopyFiles@2's top-level glob, no-overwrite policy
+      # and successful no-match behavior. Shell failures propagate normally.
+      - name: Stage WAR file
+        run: |
+          test -d target
+          shopt -s nullglob dotglob
+          for file in target/*.war; do
+            if [[ -f "$file" ]]; then
+              destination="$ARTIFACT_STAGING_DIRECTORY/${file##*/}"
+              if [[ ! -e "$destination" ]]; then
+                cp -- "$file" "$destination"
+              fi
+            fi
+          done
+
+      - name: Publish WAR artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: drop
+          path: ${{ env.ARTIFACT_STAGING_DIRECTORY }}/
+          include-hidden-files: true
+          # CopyFiles@2 succeeds on no matches; do not invent a WAR gate.
+          # GitHub cannot publish an empty artifact; this is a reported gap.
+          if-no-files-found: warn
