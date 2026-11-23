@@ -1,0 +1,119 @@
+# Source: azure-pipelines.yml (Maven@4, Cache@2,
+# PublishCodeCoverageResults@2, CopyFiles@2, PublishBuildArtifacts@1).
+# Partial CI migration: raw reports do not replace ADO test/coverage dashboards.
+# Effective ADO UI schedules, checkout depth/tags, fork policy and retention
+# remain unverified. No schedule or new quality gate is inferred.
+name: Maven CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions: {}
+
+# ADO PR autoCancel defaults to true; push batch defaults to false.
+# Only PR updates share a group. Push/manual runs each have a unique group.
+concurrency:
+  group: maven-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    # Documented ADO agent-job default, not a new build timeout.
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          lfs: false
+          submodules: false
+          # GitHub defaults are explicit; effective ADO UI values are unknown.
+          fetch-depth: 1
+          fetch-tags: false
+
+      # Runtime paths cannot use runner context in workflow/job-level env.
+      - name: Initialize Maven and artifact paths
+        run: |
+          printf 'MAVEN_CACHE_FOLDER=%s\n' "$RUNNER_TEMP/.m2/repository" >> "$GITHUB_ENV"
+          printf 'MAVEN_OPTS=-Dmaven.repo.local=%s\n' "$RUNNER_TEMP/.m2/repository" >> "$GITHUB_ENV"
+          printf 'ARTIFACT_STAGING_DIRECTORY=%s\n' "$RUNNER_TEMP/war-staging" >> "$GITHUB_ENV"
+
+      - name: Cache Maven packages
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.MAVEN_CACHE_FOLDER }}
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      - name: Set up JDK 11 x64
+        uses: actions/setup-java@v5
+        with:
+          java-version: '11'
+          distribution: temurin
+          architecture: x64
+          # Source has no feed authentication; generated publishing settings
+          # must not affect Maven's normal ~/.m2/settings.xml.
+          settings-path: ${{ runner.temp }}/java-setup-settings
+
+      - name: Build, test and package
+        id: maven
+        env:
+          # Avoid setup-java's implicit -ntp argument without relying on
+          # action inputs absent from the trusted validator's bundled schema.
+          MAVEN_ARGS: ''
+        run: |
+          mvn -version
+          mvn -f pom.xml -B clean verify
+
+      # Maven@4 collects matching JUnit reports even when Maven fails.
+      # This preserves files, not ADO test runs, annotations or history.
+      - name: Collect JUnit reports
+        if: ${{ !cancelled() && (steps.maven.outcome == 'success' || steps.maven.outcome == 'failure') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: junit-results
+          path: '**/surefire-reports/TEST-*.xml'
+          if-no-files-found: warn
+
+      # succeededOrFailed() excludes cancellation. The POM owns JaCoCo 0.8.2;
+      # do not inject instrumentation or impose a coverage percentage gate.
+      # ADO v2 cjson, source-linked dashboard and diff coverage remain gaps.
+      - name: Collect JaCoCo coverage
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: jacoco-coverage
+          path: target/site/jacoco/
+          if-no-files-found: warn
+
+      # Native copying adapts CopyFiles@2's nonrecursive *.war staging.
+      # nullglob preserves its successful no-match behavior; cp failures still
+      # fail the step. A fresh hosted runner supplies a clean staging directory.
+      - name: Stage WAR file
+        run: |
+          mkdir -p "$ARTIFACT_STAGING_DIRECTORY"
+          shopt -s nullglob
+          war_files=(target/*.war)
+          if (( ${#war_files[@]} > 0 )); then
+            cp --no-clobber -- "${war_files[@]}" "$ARTIFACT_STAGING_DIRECTORY/"
+          fi
+
+      - name: Publish WAR artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: drop
+          path: ${{ env.ARTIFACT_STAGING_DIRECTORY }}/
+          if-no-files-found: warn
