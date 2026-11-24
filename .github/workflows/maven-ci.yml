@@ -1,0 +1,107 @@
+# Source: azure-pipelines.yml (Maven@4, Cache@2, coverage and WAR publication).
+# Partial migration: raw reports are not Azure test/coverage dashboard parity.
+# The reporting blocker must be replaced safely before drop can be published.
+name: Maven CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# ADO pr.autoCancel defaults to true. Push/manual runs get unique groups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ github.workspace }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6.0.0
+        with:
+          persist-credentials: false
+          lfs: false
+          submodules: false
+        # Effective ADO fetch depth/tag settings were not supplied.
+        # Checkout's depth-1/no-tags defaults are not verified source parity.
+
+      - name: Set up JDK 11 x64
+        uses: actions/setup-java@v5.0.0
+        with:
+          distribution: temurin
+          java-version: '11'
+          architecture: x64
+          overwrite-settings: false
+
+      - name: Initialize Maven paths
+        run: |
+          printf 'MAVEN_CACHE_FOLDER=%s/.m2/repository\n' "$RUNNER_WORKSPACE" >> "$GITHUB_ENV"
+          printf 'MAVEN_OPTS=-Dmaven.repo.local=%s/.m2/repository\n' "$RUNNER_WORKSPACE" >> "$GITHUB_ENV"
+          printf 'ARTIFACT_STAGING_DIRECTORY=%s/war-staging\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Cache Maven packages
+        uses: actions/cache@v5.0.0
+        with:
+          path: ${{ env.MAVEN_CACHE_FOLDER }}
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+
+      # Preserve goals/options and use the runner's installed Maven.
+      # JaCoCo instrumentation/report generation remain owned by the POM.
+      - name: Build, test and package
+        id: maven
+        run: mvn -f pom.xml -B clean verify
+
+      - name: Collect available JUnit XML (not test dashboard publication)
+        if: ${{ !cancelled() && (success() || failure()) }}
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: junit-results
+          path: '**/surefire-reports/TEST-*.xml'
+          if-no-files-found: warn
+
+      - name: Collect available POM JaCoCo reports (not coverage dashboard publication)
+        if: ${{ !cancelled() && (success() || failure()) }}
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: jacoco-coverage
+          path: target/site/jacoco/
+          if-no-files-found: warn
+
+      - name: Block unresolved test and coverage publication
+        if: ${{ !cancelled() && (success() || failure()) }}
+        run: |
+          printf '%s\n' '::error::Migration blocked: Maven@4 JUnit test-run publication and PublishCodeCoverageResults@2 coverage tab, source-linked HTML/CJSON and diff reporting do not have an authorized equivalent implementation. Raw junit-results and jacoco-coverage artifacts are collection only. Supply an equivalent reporting implementation, or explicitly approve reduced reporting and its failure policy. Replace this blocker safely; WAR staging and drop publication must remain dependent on successful report publication.'
+          exit 1
+
+      # Default success conditions retain the source's downstream gating.
+      - name: Stage WAR files
+        run: |
+          mkdir -p "$ARTIFACT_STAGING_DIRECTORY"
+          shopt -s nullglob
+          for war in target/*.war; do
+            destination="$ARTIFACT_STAGING_DIRECTORY/${war##*/}"
+            if [[ ! -e "$destination" ]]; then
+              cp -- "$war" "$destination"
+            fi
+          done
+
+      - name: Publish WAR artifact
+        uses: actions/upload-artifact@v6.0.0
+        with:
+          name: drop
+          path: ${{ env.ARTIFACT_STAGING_DIRECTORY }}
+          if-no-files-found: warn
